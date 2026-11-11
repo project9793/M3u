@@ -126,6 +126,14 @@ jobs:
 
           # Mirror fallback: Maven Central sometimes answers 403 from CI runners
           cat > "$GITHUB_WORKSPACE/_init.gradle" <<'GRADLEEOF'
+          allprojects {
+              configurations.all {
+                  // Old kotlin-stdlib-jdk7/jdk8 shims duplicate classes that are
+                  // already inside kotlin-stdlib 1.8+, which breaks Java projects.
+                  exclude group: "org.jetbrains.kotlin", module: "kotlin-stdlib-jdk7"
+                  exclude group: "org.jetbrains.kotlin", module: "kotlin-stdlib-jdk8"
+              }
+          }
           settingsEvaluated { settings ->
               def mirrors = [
                   "https://maven.aliyun.com/repository/google",
