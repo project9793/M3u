@@ -1,0 +1,118 @@
+name: Build APK from zip
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find the Kotlin/Android project inside the zip
+        id: find
+        run: |
+          set -euo pipefail
+          rm -rf _work out && mkdir -p _work out
+          shopt -s nullglob
+          zips=(*.zip */*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "::error::Koi .zip nahi mila. Apna Kotlin/Android project zip karke repo me push karein."
+            exit 1
+          fi
+          for z in "${zips[@]}"; do
+            echo "extracting $z"
+            unzip -q -o "$z" -d _work
+          done
+          root=$(find _work -maxdepth 5 -name 'settings.gradle*' -printf '%h\n' | head -1)
+          if [ -z "${root:-}" ]; then
+            echo "::error::Zip ke andar settings.gradle(.kts) nahi mila — ye Gradle/Android project nahi lagta."
+            exit 1
+          fi
+          echo "project root: $root"
+          echo "root=$root" >> "$GITHUB_OUTPUT"
+
+      - name: Detect Gradle and JDK version
+        id: toolchain
+        run: |
+          set -euo pipefail
+          root="${{ steps.find.outputs.root }}"
+          props="$root/gradle/wrapper/gradle-wrapper.properties"
+          version=""
+          wrapper="false"
+          if [ -f "$props" ]; then
+            wrapper="true"
+            version=$(grep -oE 'gradle-[0-9]+(\.[0-9]+)*(-[a-z0-9]+)?-bin\.zip' "$props" | head -1 | sed -E 's/^gradle-//; s/-bin\.zip$//' || true)
+          fi
+          major=$(echo "${version:-0}" | cut -d. -f1)
+          if [ "${major:-0}" -ge 9 ]; then java="21"; else java="17"; fi
+          echo "wrapper=$wrapper" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "java=$java" >> "$GITHUB_OUTPUT"
+          echo "gradle=$version (wrapper=$wrapper), java=$java"
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.toolchain.outputs.java }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: ${{ steps.toolchain.outputs.wrapper == 'true' && steps.toolchain.outputs.version || '8.7' }}
+
+      - name: Build debug APK
+        run: |
+          set -euo pipefail
+          root="${{ steps.find.outputs.root }}"
+          echo "sdk.dir=$ANDROID_HOME" > "$root/local.properties"
+          cd "$root"
+          if [ -x ./gradlew ]; then
+            ./gradlew assembleDebug --no-daemon --stacktrace
+          else
+            gradle assembleDebug --no-daemon --stacktrace
+          fi
+
+      - name: Collect APK files
+        id: apks
+        run: |
+          set -euo pipefail
+          count=0
+          while IFS= read -r f; do
+            module=$(echo "$f" | sed -E 's#.*/([^/]+)/build/outputs/apk/debug/[^/]+\.apk#\1#')
+            cp "$f" "out/${module}-debug.apk"
+            count=$((count + 1))
+          done < <(find _work -path '*/build/outputs/apk/debug/*.apk' -type f)
+          ls -la out
+          if [ "$count" -eq 0 ]; then
+            echo "::error::Build chal gaya par koi APK nahi bana. Module ka naam / applicationId check karein."
+            exit 1
+          fi
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zip-build-apk
+          path: out/*.apk
+          if-no-files-found: error
+
+      - name: Publish APK to release
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0
+          name: ${{ github.event.repository.name }} v1.0.0
+          body: |
+            APK built automatically from the zip in this repository.
+
+            Download: https://github.com/${{ github.repository }}/releases/latest/download/
+          files: out/*.apk
+          fail_on_unmatched_files: true
