@@ -15,7 +15,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Find the Kotlin/Android project inside the zip
+      - name: Find the Android project inside the zip
         id: find
         run: |
           set -euo pipefail
@@ -23,7 +23,7 @@ jobs:
           shopt -s nullglob
           zips=(*.zip */*.zip)
           if [ ${#zips[@]} -eq 0 ]; then
-            echo "::error::Koi .zip nahi mila. Apna Kotlin/Android project zip karke repo me push karein."
+            echo "::error::Koi .zip nahi mila. Android project (Kotlin/Java + XML) zip karke repo me push karein."
             exit 1
           fi
           for z in "${zips[@]}"; do
@@ -32,30 +32,66 @@ jobs:
           done
           root=$(find _work -maxdepth 5 -name 'settings.gradle*' -printf '%h\n' | head -1)
           if [ -z "${root:-}" ]; then
-            echo "::error::Zip ke andar settings.gradle(.kts) nahi mila — ye Gradle/Android project nahi lagta."
+            echo "::error::Zip ke andar settings.gradle(.kts) nahi mila — ye Android/Gradle project nahi hai."
+            echo "::error::Zip ke andar poora project hona chahiye: settings.gradle.kts, build.gradle.kts, app/ folder."
+            exit 1
+          fi
+          if [ ! -d "$root/app" ] && ! ls "$root"/*/build.gradle* >/dev/null 2>&1; then
+            echo "::error::Koi Android module (app/build.gradle.kts) nahi mila."
             exit 1
           fi
           echo "project root: $root"
+          ls "$root"
           echo "root=$root" >> "$GITHUB_OUTPUT"
 
-      - name: Detect Gradle and JDK version
+      - name: Detect toolchain (AGP, Gradle, JDK, compileSdk)
         id: toolchain
         run: |
           set -euo pipefail
           root="${{ steps.find.outputs.root }}"
+
+          # --- Android Gradle Plugin version ---
+          agp=$(grep -rhoE 'com\.android\.(application|library)"?\)?[[:space:]]*version[[:space:]]*"[0-9]+(\.[0-9]+)*"' \
+                  --include=build.gradle --include=build.gradle.kts "$root" 2>/dev/null \
+                | grep -oE '[0-9]+(\.[0-9]+)*"' | tr -d '"' | sort -V | tail -1 || true)
+          if [ -z "${agp:-}" ]; then
+            agp=$(grep -rhoE '^\s*agp\s*=\s*"[0-9]+(\.[0-9]+)*"' --include=libs.versions.toml "$root" 2>/dev/null \
+                  | grep -oE '[0-9]+(\.[0-9]+)*' | sort -V | tail -1 || true)
+          fi
+
+          # --- Gradle version: project wrapper wins, else derive from AGP ---
           props="$root/gradle/wrapper/gradle-wrapper.properties"
-          version=""
           wrapper="false"
+          gradle_ver=""
           if [ -f "$props" ]; then
             wrapper="true"
-            version=$(grep -oE 'gradle-[0-9]+(\.[0-9]+)*(-[a-z0-9]+)?-bin\.zip' "$props" | head -1 | sed -E 's/^gradle-//; s/-bin\.zip$//' || true)
+            gradle_ver=$(grep -oE 'gradle-[0-9]+(\.[0-9]+)*(-[a-z0-9]+)?-bin\.zip' "$props" | head -1 | sed -E 's/^gradle-//; s/-bin\.zip$//' || true)
           fi
-          major=$(echo "${version:-0}" | cut -d. -f1)
-          if [ "${major:-0}" -ge 9 ]; then java="21"; else java="17"; fi
-          echo "wrapper=$wrapper" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "java=$java" >> "$GITHUB_OUTPUT"
-          echo "gradle=$version (wrapper=$wrapper), java=$java"
+          if [ -z "${gradle_ver:-}" ]; then
+            agp_major=$(echo "${agp:-8}" | cut -d. -f1)
+            if [ "${agp_major:-8}" -ge 9 ]; then gradle_ver="9.6.0"; else gradle_ver="8.7"; fi
+          fi
+
+          # --- JDK: Gradle 9 needs 21, everything else 17 ---
+          g_major=$(echo "$gradle_ver" | cut -d. -f1)
+          if [ "${g_major:-8}" -ge 9 ]; then java="21"; else java="17"; fi
+
+          # --- compileSdk, so we can pre-install the platform ---
+          csdk=$(grep -rhoE 'compileSdk[[:space:]]*=?[[:space:]]*[0-9]{2}' --include=build.gradle --include=build.gradle.kts "$root" 2>/dev/null \
+                 | grep -oE '[0-9]{2}' | sort -n | tail -1 || true)
+          if [ -z "${csdk:-}" ]; then
+            csdk=$(grep -rhoE 'release\(([0-9]{2})\)' --include=build.gradle --include=build.gradle.kts "$root" 2>/dev/null \
+                   | grep -oE '[0-9]{2}' | sort -n | tail -1 || true)
+          fi
+
+          echo "agp=${agp:-unknown} gradle=$gradle_ver wrapper=$wrapper java=$java compileSdk=${csdk:-unknown}"
+          {
+            echo "agp=${agp:-}"
+            echo "gradle=$gradle_ver"
+            echo "wrapper=$wrapper"
+            echo "java=$java"
+            echo "csdk=${csdk:-}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up JDK
         uses: actions/setup-java@v4
@@ -66,10 +102,29 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
         with:
-          gradle-version: ${{ steps.toolchain.outputs.wrapper == 'true' && steps.toolchain.outputs.version || '8.7' }}
+          gradle-version: ${{ steps.toolchain.outputs.gradle }}
 
-      - name: Add Maven mirrors (fallback when Maven Central returns 403)
+      - name: Make the project buildable (safe, temporary copies only)
         run: |
+          set -euo pipefail
+          root="${{ steps.find.outputs.root }}"
+
+          # SDK location
+          echo "sdk.dir=$ANDROID_HOME" > "$root/local.properties"
+
+          # AndroidX is required by modern dependencies; add only if the project forgot it
+          touch "$root/gradle.properties"
+          grep -q '^android.useAndroidX=' "$root/gradle.properties" || echo 'android.useAndroidX=true' >> "$root/gradle.properties"
+          grep -q '^org.gradle.jvmargs=' "$root/gradle.properties" || echo 'org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8' >> "$root/gradle.properties"
+
+          # Pre-install the SDK platform the project asks for
+          csdk="${{ steps.toolchain.outputs.csdk }}"
+          if [ -n "${csdk:-}" ] && [ ! -d "$ANDROID_HOME/platforms/android-$csdk" ]; then
+            echo "installing SDK platform android-$csdk"
+            yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-$csdk" > /dev/null 2>&1 || true
+          fi
+
+          # Mirror fallback: Maven Central sometimes answers 403 from CI runners
           cat > "$GITHUB_WORKSPACE/_init.gradle" <<'GRADLEEOF'
           settingsEvaluated { settings ->
               def mirrors = [
@@ -93,15 +148,15 @@ jobs:
               }
           }
           GRADLEEOF
-          echo "init script written"
+          echo "prepared"
 
       - name: Build debug APK
         run: |
           set -euo pipefail
           root="${{ steps.find.outputs.root }}"
-          echo "sdk.dir=$ANDROID_HOME" > "$root/local.properties"
           cd "$root"
-          if [ -x ./gradlew ]; then
+          chmod +x ./gradlew 2>/dev/null || true
+          if [ -x ./gradlew ] && [ "${{ steps.toolchain.outputs.wrapper }}" = "true" ]; then
             ./gradlew assembleDebug --no-daemon --stacktrace -I "$GITHUB_WORKSPACE/_init.gradle"
           else
             gradle assembleDebug --no-daemon --stacktrace -I "$GITHUB_WORKSPACE/_init.gradle"
@@ -119,7 +174,7 @@ jobs:
           done < <(find _work -path '*/build/outputs/apk/debug/*.apk' -type f)
           ls -la out
           if [ "$count" -eq 0 ]; then
-            echo "::error::Build chal gaya par koi APK nahi bana. Module ka naam / applicationId check karein."
+            echo "::error::Build chal gaya par koi APK nahi bana — applicationId / module check karein."
             exit 1
           fi
           echo "count=$count" >> "$GITHUB_OUTPUT"
@@ -138,6 +193,6 @@ jobs:
           tag_name: v1.0.0
           name: ${{ github.event.repository.name }} v1.0.0
           body: |
-            APK built automatically from the zip uploaded to this repository.
+            APK built automatically from the Android project zip in this repository.
           files: out/*.apk
           fail_on_unmatched_files: true
