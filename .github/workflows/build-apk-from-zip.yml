@@ -68,6 +68,33 @@ jobs:
         with:
           gradle-version: ${{ steps.toolchain.outputs.wrapper == 'true' && steps.toolchain.outputs.version || '8.7' }}
 
+      - name: Add Maven mirrors (fallback when Maven Central returns 403)
+        run: |
+          cat > "$GITHUB_WORKSPACE/_init.gradle" <<'GRADLEEOF'
+          settingsEvaluated { settings ->
+              def mirrors = [
+                  "https://maven.aliyun.com/repository/google",
+                  "https://maven.aliyun.com/repository/public",
+                  "https://repo.huaweicloud.com/repository/maven"
+              ]
+              settings.pluginManagement.repositories.clear()
+              settings.pluginManagement.repositories {
+                  mirrors.each { u -> maven { url = uri(u) } }
+                  maven { url = uri("https://maven.aliyun.com/repository/gradle-plugin") }
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+              settings.dependencyResolutionManagement.repositories.clear()
+              settings.dependencyResolutionManagement.repositories {
+                  mirrors.each { u -> maven { url = uri(u) } }
+                  google()
+                  mavenCentral()
+              }
+          }
+          GRADLEEOF
+          echo "init script written"
+
       - name: Build debug APK
         run: |
           set -euo pipefail
@@ -75,9 +102,9 @@ jobs:
           echo "sdk.dir=$ANDROID_HOME" > "$root/local.properties"
           cd "$root"
           if [ -x ./gradlew ]; then
-            ./gradlew assembleDebug --no-daemon --stacktrace
+            ./gradlew assembleDebug --no-daemon --stacktrace -I "$GITHUB_WORKSPACE/_init.gradle"
           else
-            gradle assembleDebug --no-daemon --stacktrace
+            gradle assembleDebug --no-daemon --stacktrace -I "$GITHUB_WORKSPACE/_init.gradle"
           fi
 
       - name: Collect APK files
@@ -111,8 +138,6 @@ jobs:
           tag_name: v1.0.0
           name: ${{ github.event.repository.name }} v1.0.0
           body: |
-            APK built automatically from the zip in this repository.
-
-            Download: https://github.com/${{ github.repository }}/releases/latest/download/
+            APK built automatically from the zip uploaded to this repository.
           files: out/*.apk
           fail_on_unmatched_files: true
